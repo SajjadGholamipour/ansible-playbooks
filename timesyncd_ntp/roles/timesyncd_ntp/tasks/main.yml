@@ -1,0 +1,152 @@
+---
+- name: Validate NTP server IP
+  ansible.builtin.assert:
+    that:
+      - timesyncd_ntp_server is string
+      - timesyncd_ntp_server is match('^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$')
+    fail_msg: "timesyncd_ntp_server must be a valid IPv4 address. Current value: '{{ timesyncd_ntp_server }}'"
+    success_msg: "NTP server address is valid: {{ timesyncd_ntp_server }}"
+
+- name: Validate timezone name format
+  ansible.builtin.assert:
+    that:
+      - timesyncd_ntp_timezone is string
+      - timesyncd_ntp_timezone is match('^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+)*$')
+    fail_msg: "timesyncd_ntp_timezone must be a valid timezone name (e.g. 'Asia/Tehran', 'UTC'). Current value: '{{ timesyncd_ntp_timezone }}'"
+    success_msg: "Timezone name format is valid: {{ timesyncd_ntp_timezone }}"
+  when: timesyncd_ntp_timezone | length > 0
+
+- name: Check that the timezone exists in the system tz database
+  ansible.builtin.stat:
+    path: "{{ timesyncd_ntp_tzdata_dir }}/{{ timesyncd_ntp_timezone }}"
+  register: timesyncd_ntp_tz_file
+  when: timesyncd_ntp_timezone | length > 0
+
+- name: Fail if the timezone is not installed
+  ansible.builtin.fail:
+    msg: "Timezone '{{ timesyncd_ntp_timezone }}' was not found in {{ timesyncd_ntp_tzdata_dir }}. Install the tzdata package or use a valid name (e.g. 'Asia/Tehran')."
+  when:
+    - timesyncd_ntp_timezone | length > 0
+    - not timesyncd_ntp_tz_file.stat.exists
+
+- name: Read current timezone
+  ansible.builtin.command: timedatectl show --property=Timezone --value
+  register: timesyncd_ntp_current_tz
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: timesyncd_ntp_timezone | length > 0
+
+- name: Set system timezone
+  ansible.builtin.command: timedatectl set-timezone {{ timesyncd_ntp_timezone }}
+  register: timesyncd_ntp_tz_set
+  changed_when: true
+  failed_when: false
+  when:
+    - timesyncd_ntp_timezone | length > 0
+    - timesyncd_ntp_current_tz.stdout | default('') != timesyncd_ntp_timezone
+    - not ansible_check_mode
+
+- name: Warn if setting the timezone failed
+  ansible.builtin.debug:
+    msg: >-
+      Could not set timezone to '{{ timesyncd_ntp_timezone }}'.
+      {{ timesyncd_ntp_tz_set.stderr | default('') | trim }}
+  when:
+    - timesyncd_ntp_timezone | length > 0
+    - timesyncd_ntp_tz_set is not skipped
+    - timesyncd_ntp_tz_set.rc | default(0) != 0
+
+- name: Set NTP server in timesyncd.conf
+  ansible.builtin.lineinfile:
+    path: "{{ timesyncd_ntp_config_file }}"
+    regexp: '^#?\s*NTP='
+    line: "NTP={{ timesyncd_ntp_server }}"
+    insertafter: '^\[Time\]'
+    owner: root
+    group: root
+    mode: "0644"
+    create: true
+  notify: Restart systemd-timesyncd
+  register: timesyncd_ntp_conf
+
+- name: Ensure systemd-timesyncd is enabled and started
+  ansible.builtin.systemd_service:
+    name: systemd-timesyncd
+    enabled: true
+    state: started
+
+- name: Apply pending handlers (restart timesyncd)
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for a real reply from the NTP server
+  # NTPSynchronized is a sticky flag (stays "yes" after the server was changed
+  # or became unreachable). The packet count is reset on every service restart,
+  # so a count > 0 proves that the configured server actually answered.
+  ansible.builtin.shell: |
+    sync=no; packets=0
+    for _ in $(seq 1 {{ timesyncd_ntp_sync_retries | int }}); do
+      sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+      packets=$(timedatectl timesync-status 2>/dev/null | awk -F': *' '/Packet count/ {print $2+0}')
+      [ -z "$packets" ] && packets=0
+      [ "$sync" = "yes" ] && [ "$packets" -gt 0 ] && break
+      sleep {{ timesyncd_ntp_sync_delay | int }}
+    done
+    if [ "$sync" = "yes" ] && [ "$packets" -gt 0 ]; then echo yes; else echo no; fi
+  args:
+    executable: /bin/bash
+  register: timesyncd_ntp_sync_state
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Get active NTP server reported by timesyncd
+  ansible.builtin.command: timedatectl show-timesync --property=ServerAddress --value
+  register: timesyncd_ntp_active_server
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Get effective timezone after configuration
+  ansible.builtin.command: timedatectl show --property=Timezone --value
+  register: timesyncd_ntp_final_tz
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Build sync report
+  ansible.builtin.set_fact:
+    timesyncd_ntp_report:
+      host: "{{ inventory_hostname }}"
+      configured_server: "{{ timesyncd_ntp_server }}"
+      configured_timezone: "{{ timesyncd_ntp_timezone | default('', true) }}"
+      current_timezone: "{{ timesyncd_ntp_final_tz.stdout | default('unknown') | trim }}"
+      timezone_changed: "{{ (timesyncd_ntp_tz_set is not skipped) and (timesyncd_ntp_tz_set.rc | default(0) == 0) }}"
+      config_changed: "{{ timesyncd_ntp_conf.changed }}"
+      active_server: "{{ timesyncd_ntp_active_server.stdout | default('unknown') }}"
+      checked: "{{ not ansible_check_mode }}"
+      synchronized: "{{ (timesyncd_ntp_sync_state.stdout | default('unknown')) == 'yes' }}"
+
+- name: Report NTP sync result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Sync check not performed in check mode ⚠️' if not timesyncd_ntp_report.checked
+         else ('Clock synchronized successfully ✅' if timesyncd_ntp_report.synchronized
+         else 'Clock NOT synchronized ❌ (no reply from the NTP server: check that it is reachable on 123/udp)') }}
+      | host={{ timesyncd_ntp_report.host }}
+      | configured={{ timesyncd_ntp_report.configured_server }}
+      | active={{ timesyncd_ntp_report.active_server }}
+      | timezone={{ timesyncd_ntp_report.current_timezone }}
+      {%- if timesyncd_ntp_report.configured_timezone | length > 0 %}
+      | timezone_target={{ timesyncd_ntp_report.configured_timezone }}
+      {%- endif %}
+      | tz_changed={{ timesyncd_ntp_report.timezone_changed }}
+      | config_changed={{ timesyncd_ntp_report.config_changed }}
+
+- name: Fail if clock is not synchronized (optional)
+  ansible.builtin.fail:
+    msg: "Clock on {{ inventory_hostname }} did not synchronize with {{ timesyncd_ntp_server }}."
+  when:
+    - timesyncd_ntp_fail_if_unsynced | bool
+    - not timesyncd_ntp_report.synchronized
+    - not ansible_check_mode

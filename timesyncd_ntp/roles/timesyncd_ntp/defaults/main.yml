@@ -1,0 +1,22 @@
+---
+# IPv4 address of the NTP server (required).
+# Normally set globally in group_vars/all.yml.
+timesyncd_ntp_server: ""
+
+# System timezone (e.g. "Asia/Tehran", "UTC"). Empty means "leave unchanged".
+# Normally set globally in group_vars/all.yml.
+timesyncd_ntp_timezone: ""
+
+# Path to systemd-timesyncd config file
+timesyncd_ntp_config_file: /etc/systemd/timesyncd.conf
+
+# Directory holding the system timezone database (used to validate the name)
+timesyncd_ntp_tzdata_dir: /usr/share/zoneinfo
+
+# Number of checks and delay (seconds) for verifying sync after configuration
+timesyncd_ntp_sync_retries: 12
+timesyncd_ntp_sync_delay: 5
+
+# If true, the play fails when the clock is not synchronized
+# Normally set globally in group_vars/all.yml.
+timesyncd_ntp_fail_if_unsynced: false

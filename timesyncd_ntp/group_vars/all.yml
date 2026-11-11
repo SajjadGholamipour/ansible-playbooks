@@ -1,0 +1,11 @@
+---
+# Global settings for all hosts
+
+# IPv4 address of the NTP server
+timesyncd_ntp_server: 192.168.1.10
+
+# System timezone (empty = leave unchanged)
+timesyncd_ntp_timezone: Asia/Tehran
+
+# If true, the play fails when the clock does not synchronize
+timesyncd_ntp_fail_if_unsynced: false
